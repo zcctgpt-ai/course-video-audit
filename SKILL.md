@@ -11,7 +11,7 @@ description: 讲师授课视频批量核验。当用户提供"研究所授课汇
 
 1. **全程不停**：材料齐了就一口气跑完全部流程再交付；中途不逐条请示。只有两种情况允许停下来找用户——登录墙（需要用户人工登录）和取流持续失败需用户换链接。
 2. **缺料先问齐再跑**：开工前按下文"开工前清单"自查，缺什么一次性向用户要齐（AskUserQuestion 或一条消息列全），不要挤牙膏式反复追问。
-3. **人脸是身份的唯一证明**：姓名条 OCR 只作旁证。没有讲师照片时，时长/费用照跑，人脸列标"待照片"，并把"提供照片"写进报告下一步。
+3. **人脸是身份的唯一证明，且只认 ArcFace 向量比对**：姓名条**不是证据**——平台姓名条存在系统性错标（实战案例：讲师本人出镜时段名牌显示"讲师：郭文伟/Z0015767"，导致首版报告误判挂名）。身份判定一律走 `arcface_check.py` 向量比对 + 阴性对照校准；多模态视觉拼图只作人工复核参考，禁止单独作为判定依据。没有讲师照片时，时长/费用照跑，人脸列标"待照片"，并把"提供照片"写进报告下一步。
 4. **时长探测失败的记录永远不许标 done**，只能重试（≤3 次）；宁可报告里写"待复核"，不许出假数据。
 5. 并发 workers=2 + 随机抖动，**不许调大**（保利威风控）。工程细节见 `references/pitfalls.md`，判定口径见 `references/checks.md`，报告样式见 `references/report_spec.md`。
 
@@ -64,15 +64,20 @@ python scripts/pipeline.py --workdir <workdir> --workers 2 --frames 8
 - 费用校验：授课费 ≈ 课时×课时费率（差 >1 元标红）；另做**逐条加总 vs 表内汇总单元格**的勾稽（需从 Excel 单独读汇总单元格），差额标红进报告。
 - 类型判定以回放页标题为准（专场 vs 栏目切片，口径见 checks.md）。
 
-### Phase 3 — 人脸核验（agent 亲自做多模态比对）
-1. 对每位讲师（有照片者）逐条生成拼图：
+### Phase 3 — 人脸核验（ArcFace 向量比对为准，拼图仅复核）
+1. **先跑向量比对**（客观证据，逐帧出相似度）：
+```bash
+python scripts/arcface_check.py --ref <讲师照片> --frames-dir <workdir>/frames/<讲师_rid> [--pip]
+```
+   - 模型：YuNet 检测 + ArcFace w600k_r50，首次运行自动下载到 `C:/temp/face_models/`（hf-mirror；**模型路径必须纯 ASCII**，OpenCV DNN 读不了中文路径）。
+   - **必须做阴性对照**：取视频中确定非本人者的帧（其他讲师出镜段）算相似度作基线（通常 <0.1），本人帧通常 >0.3（底库证件照 vs 直播画质下限约 0.3）。两组分离才可判定；不分离就升级人工复核并标注不确定性。
+2. 向量比对完成后再出拼图供人工快速复核：
 ```bash
 python scripts/make_montage.py --frames-dir <workdir>/frames/<讲师_rid> --out <workdir>/montages_face/<讲师_rid>.jpg --mode pip
 ```
-2. 先 Read 讲师底库照片建立基准，再逐张 Read 拼图比对（一次批量读 3-4 张）。
-3. 每条记录判定：出镜帧数 N/8、人脸与照片是否一致、姓名条是否相符。
+3. 有"授课时间段"（分钟区间）的记录，用 `extract_slot_frames.py` 在**申报区间内**抽帧核验（比整片均匀抽帧强得多）。
 4. 画中画拼图看不到人 → `--mode full` 出全帧拼图复查；仍无人 → 判"纯屏幕录制·无人脸画面·无法核验"。
-5. 比对不符（疑似冒名）→ 立即标红，单独向用户报告，不混进常规汇总。
+5. 判定与申报矛盾（如疑似挂名）→ **出红牌前必须过"反证程序"**：①ArcFace 向量比对（含阴性对照）且全片密集抽帧；②假设"人是本人"主动找支持证据（换时间段抽帧、全片扫描），找不到才允许出红牌；③红牌结论永远附证据（帧+相似度数值）交客户确认，**AI 不单方定罪**；④争议条可叠加语音说话人分离做第二通道，双通道一致才最终定论。**注意：姓名条与画面不符时，以向量比对为准，并把姓名条异常本身写进报告**（可能是平台错标，也可能是真冒名）。
 
 ### Phase 4 — 出报告 + 交付
 1. 按 `references/report_spec.md` 写 `<客户名>核验报告_<年季度>.html`，六段结构，三色语义，数字逐项勾稽自检。
@@ -87,7 +92,9 @@ python scripts/make_montage.py --frames-dir <workdir>/frames/<讲师_rid> --out 
 - `scripts/parse_excel.py` — Excel → records.jsonl（表头关键字定位，多链接拆行）
 - `scripts/fetch_stream.js` — 取流 worker（CDP 优先/cookie 回退，按钮点击，抓 m3u8/mp4 + liveStart）
 - `scripts/pipeline.py` — 批量核验（SQLite 断点续跑，时长/费用/日期判定，抽帧）
-- `scripts/make_montage.py` — 人脸比对拼图（画中画裁剪/全帧两种模式）
-- `references/pitfalls.md` — 工程踩坑手册（浏览器/保利威/ffmpeg/SQLite/ASR，逐条照做）
-- `references/checks.md` — 核验口径（类型语义、费率表、勾稽纪律、人脸判定三档）
+- `scripts/arcface_check.py` — **身份判定主依据**：YuNet 检测 + ArcFace 向量比对，含阴性对照校准
+- `scripts/extract_slot_frames.py` — 申报切片区间内精确抽帧
+- `scripts/make_montage.py` — 人工复核拼图（画中画裁剪/全帧两种模式，仅参考不作判定）
+- `references/pitfalls.md` — 工程踩坑手册（浏览器/保利威/ffmpeg/SQLite/人脸模型，逐条照做）
+- `references/checks.md` — 核验口径（类型语义、费率表、勾稽纪律、人脸判定三档与阈值校准）
 - `references/report_spec.md` — 报告结构与交付纪律
